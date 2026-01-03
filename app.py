@@ -84,12 +84,12 @@ def fetch_transactions(address: str):
             tx_resp = client.get_transaction(sig_info.signature, encoding="jsonParsed", max_supported_transaction_version=0)
             tx = tx_resp.value
             if not tx:
-                continue
+                continue  # Old tx or not available
 
-            # Structure: tx.transaction.meta and tx.transaction.transaction.message.instructions
+            # Correct structure: tx.transaction is EncodedTransactionWithStatusMeta
             encoded_tx = tx.transaction
             meta = encoded_tx.meta
-            inner_transaction = encoded_tx.transaction
+            transaction = encoded_tx.transaction
 
             if meta and meta.err:
                 continue
@@ -97,9 +97,9 @@ def fetch_transactions(address: str):
             timestamp = datetime.utcfromtimestamp(sig_info.block_time) if sig_info.block_time else datetime.now()
 
             transfers = []
-            message = inner_transaction.message
+            message = transaction.message
             for instr in message.instructions:
-                # Some instructions are parsed (dict with 'parsed'), others partially decoded (accounts + data)
+                # Safe check for parsed
                 if hasattr(instr, "parsed") and instr.parsed:
                     parsed = instr.parsed
                     if parsed.get("type") in ["transfer", "transferChecked"]:
