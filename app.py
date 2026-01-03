@@ -8,14 +8,17 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from io import BytesIO
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 
 from solana.rpc.api import Client
 from solders.pubkey import Pubkey as PublicKey
 
-# Constants
-RPC_URL = "https://api.mainnet-beta.solana.com"
+# === CONFIGURATION ===
+# HIGHLY RECOMMENDED: Replace with a free Alchemy or Helius RPC for maximum reliability
+# Alchemy example: "https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY"
+# Helius example: "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+RPC_URL = "https://api.mainnet-beta.solana.com"  # Public RPC (slower, less reliable)
 client = Client(RPC_URL)
 
 COINGECKO_HISTORY_URL = "https://api.coingecko.com/api/v3/coins/{id}/history"
@@ -23,10 +26,11 @@ COINGECKO_LIST_URL = "https://api.coingecko.com/api/v3/coins/list?include_platfo
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+# === COINGECKO MAPPING ===
 @st.cache_data(ttl=86400)
 def get_coingecko_mapping():
     try:
-        response = requests.get(COINGECKO_LIST_URL)
+        response = requests.get(COINGECKO_LIST_URL, timeout=10)
         if response.status_code != 200:
             return {SOL_MINT: "solana"}
         coins = response.json()
@@ -49,19 +53,20 @@ def get_historical_price(asset_id: str, date_str: str) -> float:
     try:
         url = COINGECKO_HISTORY_URL.format(id=asset_id)
         params = {"date": date_str}
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=10)
         if response.status_code != 200:
             return 0.0
-        data = response.json().get("market_data", {}).get("current_price", {}).get("usd", 0.0)
-        return data or 0.0
+        data = response.json().get("market_data", {}).get("current_price", {}).get("usd")
+        return float(data or 0.0)
     except:
         return 0.0
 
+# === TRANSACTION FETCHING ===
 def fetch_transactions(address: str):
     try:
         pubkey = PublicKey.from_string(address)
     except:
-        st.error("Invalid wallet address")
+        st.error("Invalid Solana wallet address.")
         return pd.DataFrame()
 
     all_transfers = []
@@ -71,22 +76,31 @@ def fetch_transactions(address: str):
     progress = st.progress(0)
     status = st.empty()
 
+    st.info("Fetching recent transactions — usually 30s to 2 minutes. High-activity wallets may take longer.")
+
     fetched_sigs = 0
 
     while True:
         status.text(f"Fetching signatures... ({len(all_transfers)} transfers found)")
-        resp = client.get_signatures_for_address(pubkey, limit=limit, before=before)
+        try:
+            resp = client.get_signatures_for_address(pubkey, limit=limit, before=before)
+        except Exception as e:
+            st.error(f"Error fetching signatures: {e}. Try again later or use a dedicated RPC.")
+            break
         sigs = resp.value
         if not sigs:
             break
 
         for sig_info in sigs:
-            tx_resp = client.get_transaction(sig_info.signature, encoding="jsonParsed", max_supported_transaction_version=0)
+            try:
+                tx_resp = client.get_transaction(sig_info.signature, encoding="jsonParsed", max_supported_transaction_version=0)
+            except Exception as e:
+                # Skip problematic transactions
+                continue
             tx = tx_resp.value
             if not tx:
-                continue  # Old tx or not available
+                continue
 
-            # Correct structure: tx.transaction is EncodedTransactionWithStatusMeta
             encoded_tx = tx.transaction
             meta = encoded_tx.meta
             transaction = encoded_tx.transaction
@@ -99,7 +113,6 @@ def fetch_transactions(address: str):
             transfers = []
             message = transaction.message
             for instr in message.instructions:
-                # Safe check for parsed
                 if hasattr(instr, "parsed") and instr.parsed:
                     parsed = instr.parsed
                     if parsed.get("type") in ["transfer", "transferChecked"]:
@@ -132,16 +145,25 @@ def fetch_transactions(address: str):
 
     df = pd.DataFrame(all_transfers)
     if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        # Limit to last 3 years for reliability and speed
+        cutoff = datetime.now() - timedelta(days=1095)
+        original_count = len(df)
+        df = df[df["timestamp"] >= cutoff]
+        if len(df) < original_count:
+            st.caption(f"Showing last 3 years of activity ({len(df)} transfers).")
         df = df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        st.warning("No transfers found in recent history.")
     status.empty()
     progress.empty()
     return df
 
+# === CLASSIFICATION (basic) ===
 def classify_transfers(df: pd.DataFrame):
     df["category"] = "Transfer"
     return df
 
+# === WALLET DISCOVERY ===
 def discover_wallets(df: pd.DataFrame, main_wallet: str):
     G = nx.DiGraph()
     transfer_df = df[df["category"] == "Transfer"]
@@ -151,9 +173,10 @@ def discover_wallets(df: pd.DataFrame, main_wallet: str):
     potential = [n for n in G.nodes if n != main_wallet and 1 < G.degree(n) < 20]
     return list(set(potential))
 
+# === COST BASIS CALCULATION ===
 def calculate_fifo(df: pd.DataFrame):
     if df.empty:
-        return 0.0, ["No transactions"]
+        return 0.0, ["No data"]
     df = df.copy()
     df["wallet"] = df["wallet"].fillna("unknown")
     groups = df.groupby(["wallet", "asset"])
@@ -169,10 +192,10 @@ def calculate_fifo(df: pd.DataFrame):
             price = get_historical_price(asset_id, date_str)
             amount = row["amount"]
 
-            if row["to"] == wallet:  # Incoming
+            if row["to"] == wallet:  # Incoming → acquisition
                 basis = amount * price
                 acquisitions.append((amount, basis))
-            elif row["from"] == wallet:  # Outgoing
+            elif row["from"] == wallet:  # Outgoing → disposal
                 remaining = amount
                 cost_basis = 0.0
                 while remaining > 0 and acquisitions:
@@ -190,21 +213,24 @@ def calculate_fifo(df: pd.DataFrame):
 
     return total_gains, alerts
 
+# === PDF GENERATION ===
 def generate_pdf(gains: float, alerts: list, df: pd.DataFrame):
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
     styles = getSampleStyleSheet()
     elements = []
 
-    elements.append(Paragraph("Solana Cost Basis Report (2025 IRS Compliant)", styles["Title"]))
+    elements.append(Paragraph("Solana Cost Basis Report", styles["Title"]))
     elements.append(Spacer(1, 20))
-    elements.append(Paragraph(f"<b>Total Gains/Losses:</b> ${gains:,.2f}", styles["Heading1"]))
+    elements.append(Paragraph(f"<b>Total Capital Gains/Losses:</b> ${gains:,.2f}", styles["Heading1"]))
     elements.append(Spacer(1, 20))
 
     if alerts:
-        elements.append(Paragraph("<b>Missing Basis Alerts:</b>", styles["Heading2"]))
+        elements.append(Paragraph("<b>Missing Basis Alerts (assumed $0):</b>", styles["Heading2"]))
         for a in alerts[:10]:
             elements.append(Paragraph(f"• {a}", styles["Normal"]))
+        if len(alerts) > 10:
+            elements.append(Paragraph(f"... and {len(alerts)-10} more.", styles["Normal"]))
         elements.append(Spacer(1, 12))
 
     data = [["Date", "Asset", "Amount", "From → To"]]
@@ -213,20 +239,23 @@ def generate_pdf(gains: float, alerts: list, df: pd.DataFrame):
             row["timestamp"].strftime("%Y-%m-%d"),
             row["asset"][:8] + "...",
             f"{row['amount']:.4f}",
-            f"{row['from'][:6] if row['from'] else ''} → {row['to'][:6] if row['to'] else ''}"
+            f"{(row['from'] or '')[:6]} → {(row['to'] or '')[:6]}"
         ])
     table = Table(data, colWidths=[100, 100, 80, 200])
     table.setStyle([('GRID', (0,0), (-1,-1), 0.5, colors.grey)])
     elements.append(table)
 
+    elements.append(Spacer(1, 20))
+    elements.append(Paragraph("Generated Jan 2026 • Per-wallet FIFO • Not tax advice", styles["Italic"]))
+
     doc.build(elements)
     buffer.seek(0)
     return buffer
 
-# Mobile-Friendly UI
-st.set_page_config(layout="centered", page_title="Solana Basis")
+# === UI ===
+st.set_page_config(layout="centered", page_title="Solana Cost Basis")
 st.title("🪙 Free Solana Cost Basis Calculator")
-st.caption("Mobile • 2025 IRS Per-Wallet FIFO • No signup")
+st.caption("Mobile-friendly • 2025 IRS Per-Wallet FIFO • No signup required")
 
 with st.form("main_form"):
     main_wallet = st.text_input("Main Solana Wallet Address", placeholder="e.g. 4fYNw3dojNGzMwefMZ...")
@@ -235,24 +264,27 @@ with st.form("main_form"):
 if submitted and main_wallet:
     df = fetch_transactions(main_wallet)
     if df.empty:
-        st.warning("No transactions found — try a different wallet.")
+        st.warning("No recent transfers found. Try a different wallet or check your address.")
     else:
         df = classify_transfers(df)
 
         with st.expander("🔍 Potential Owned Wallets — Check to Include"):
             potentials = discover_wallets(df, main_wallet)
-            selected = []
             for p in potentials:
                 count = df[df['from']==p].shape[0] + df[df['to']==p].shape[0]
                 if st.checkbox(f"{p[:8]}...{p[-6:]} ({count} transfers)"):
-                    selected.append(p)
                     extra = fetch_transactions(p)
                     if not extra.empty:
                         extra["wallet"] = p
                         df = pd.concat([df, extra], ignore_index=True)
 
         gains, alerts = calculate_fifo(df)
-        st.success(f"**Total Capital Gains/Losses: ${gains:,.2f}**")
+
+        st.success(f"**Total Capital Gains/Losses (last 3 years): ${gains:,.2f}**")
+        st.caption(f"Based on {len(df)} transfers across {df['wallet'].nunique()} wallet(s)")
+
+        if alerts:
+            st.warning(f"{len(alerts)} items missing cost basis — assumed $0 (conservative & IRS-safe).")
 
         pdf = generate_pdf(gains, alerts, df)
         st.download_button(
@@ -263,7 +295,7 @@ if submitted and main_wallet:
             use_container_width=True
         )
 
-        st.info("Per-wallet FIFO • Missing basis = $0 (alerted) • Not tax advice — consult a CPA.")
+        st.info("This tool uses per-wallet FIFO as required for 2025+ IRS rules. Not financial advice — consult a tax professional.")
 
 st.markdown("---")
-st.caption("Open-source • Free forever • Built Jan 2026")
+st.caption("Open-source • Free forever • Built January 2026")
