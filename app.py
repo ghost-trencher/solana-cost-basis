@@ -2,9 +2,8 @@ import streamlit as st
 import pandas as pd
 import requests
 import networkx as nx
-import matplotlib.pyplot as plt
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib import colors
 from io import BytesIO
@@ -13,27 +12,17 @@ from datetime import datetime
 import time
 
 from solana.rpc.api import Client
-from solders.pubkey import Pubkey as PublicKey  # Fixed import for 2026 solana-py/solders
+from solders.pubkey import Pubkey as PublicKey
 
 # Constants
 RPC_URL = "https://api.mainnet-beta.solana.com"
 client = Client(RPC_URL)
 
-COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
 COINGECKO_HISTORY_URL = "https://api.coingecko.com/api/v3/coins/{id}/history"
 COINGECKO_LIST_URL = "https://api.coingecko.com/api/v3/coins/list?include_platform=true"
 
-KNOWN_PROGRAMS = {
-    "Token": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-    "System": "11111111111111111111111111111111",
-    "Stake": "Stake11111111111111111111111111111111111111",
-    "Raydium": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-    "Jupiter": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
-}
-
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-# Cache CoinGecko token mapping
 @st.cache_data(ttl=86400)
 def get_coingecko_mapping():
     try:
@@ -82,6 +71,9 @@ def fetch_transactions(address: str):
     progress = st.progress(0)
     status = st.empty()
 
+    fetched_sigs = 0
+    total_sigs_estimate = 1  # Avoid division by zero
+
     while True:
         status.text(f"Fetching signatures... ({len(all_transfers)} transfers found)")
         resp = client.get_signatures_for_address(pubkey, limit=limit, before=before)
@@ -89,20 +81,28 @@ def fetch_transactions(address: str):
         if not sigs:
             break
 
-        for i, sig_info in enumerate(sigs):
+        total_sigs_estimate += len(sigs)
+        for sig_info in sigs:
             tx_resp = client.get_transaction(sig_info.signature, encoding="jsonParsed", max_supported_transaction_version=0)
             tx = tx_resp.value
-            if not tx or tx.meta.err:
+            if not tx:
+                continue
+
+            # Fixed: tx is EncodedConfirmedTransactionWithStatusMeta
+            meta = tx.transaction_meta
+            message = tx.transaction.message
+
+            if meta.err:
                 continue
 
             timestamp = datetime.utcfromtimestamp(sig_info.block_time) if sig_info.block_time else datetime.now()
 
-            # Extract parsed transfers (SOL and SPL)
             transfers = []
-            for instr in tx.transaction.message.instructions:
-                if hasattr(instr, "parsed") and instr.parsed.get("type") in ["transfer", "transferChecked"]:
+            for instr in message.instructions:
+                if instr.parsed and instr.parsed.get("type") in ["transfer", "transferChecked"]:
                     info = instr.parsed["info"]
-                    amount = float(info.get("lamports", info.get("tokenAmount", {}).get("uiAmount", 0)))
+                    amount_str = info.get("lamports") or info.get("tokenAmount", {}).get("uiAmountString", "0")
+                    amount = float(amount_str or 0)
                     mint = info.get("mint", SOL_MINT)
                     source = info.get("source")
                     destination = info.get("destination")
@@ -119,11 +119,13 @@ def fetch_transactions(address: str):
 
             all_transfers.extend(transfers)
 
-        progress.progress(min((len(sigs) / limit), 1.0))
+        fetched_sigs += len(sigs)
+        progress.progress(min(fetched_sigs / max(total_sigs_estimate, 1), 1.0))
+
         if len(sigs) < limit:
             break
         before = sigs[-1].signature
-        time.sleep(0.3)  # Polite delay
+        time.sleep(0.3)
 
     df = pd.DataFrame(all_transfers)
     if not df.empty:
@@ -134,7 +136,7 @@ def fetch_transactions(address: str):
     return df
 
 def classify_transfers(df: pd.DataFrame):
-    df["category"] = "Transfer"  # Basic; expand later
+    df["category"] = "Transfer"
     return df
 
 def discover_wallets(df: pd.DataFrame, main_wallet: str):
@@ -164,10 +166,10 @@ def calculate_fifo(df: pd.DataFrame):
             price = get_historical_price(asset_id, date_str)
             amount = row["amount"]
 
-            if row["category"] in ["Transfer"] and row["to"] == wallet:  # Incoming
+            if row["to"] == wallet:  # Incoming to this wallet
                 basis = amount * price
                 acquisitions.append((amount, basis))
-            elif row["category"] in ["Transfer"] and row["from"] == wallet:  # Outgoing = sale
+            elif row["from"] == wallet:  # Outgoing = disposal
                 remaining = amount
                 cost_basis = 0.0
                 while remaining > 0 and acquisitions:
@@ -176,7 +178,8 @@ def calculate_fifo(df: pd.DataFrame):
                     cost_basis += (use / aq_amt) * aq_basis if aq_amt > 0 else 0
                     remaining -= use
                     if use < aq_amt:
-                        acquisitions.appendleft((aq_amt - use, aq_basis - cost_basis))
+                        remaining_basis = aq_basis - (use / aq_amt * aq_basis)
+                        acquisitions.appendleft((aq_amt - use, remaining_basis))
                 if remaining > 0:
                     alerts.append(f"Missing basis for {remaining:.4f} {asset[:8]}... in {wallet[:8]}...")
                 proceeds = amount * price
@@ -201,7 +204,6 @@ def generate_pdf(gains: float, alerts: list, df: pd.DataFrame):
             elements.append(Paragraph(f"• {a}", styles["Normal"]))
         elements.append(Spacer(1, 12))
 
-    # Sample transactions table
     data = [["Date", "Asset", "Amount", "From → To"]]
     for _, row in df.head(20).iterrows():
         data.append([
@@ -238,7 +240,8 @@ if submitted and main_wallet:
             potentials = discover_wallets(df, main_wallet)
             selected = []
             for p in potentials:
-                if st.checkbox(f"{p[:8]}...{p[-6:]} ({df[df['from']==p].shape[0] + df[df['to']==p].shape[0]} transfers)"):
+                count = df[df['from']==p].shape[0] + df[df['to']==p].shape[0]
+                if st.checkbox(f"{p[:8]}...{p[-6:]} ({count} transfers)"):
                     selected.append(p)
                     extra = fetch_transactions(p)
                     if not extra.empty:
