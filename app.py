@@ -86,10 +86,9 @@ def fetch_transactions(address: str):
             if not tx:
                 continue
 
-            # Fixed access: meta and transaction are direct attributes
+            # Correct attribute access for EncodedConfirmedTransactionWithStatusMeta
             meta = tx.meta
             transaction = tx.transaction
-
             if meta and meta.err:
                 continue
 
@@ -98,8 +97,9 @@ def fetch_transactions(address: str):
             transfers = []
             message = transaction.message
             for instr in message.instructions:
-                if instr.parsed and instr.parsed.get("type") in ["transfer", "transferChecked"]:
-                    info = instr.parsed["info"]
+                parsed = instr.parsed
+                if parsed and parsed.get("type") in ["transfer", "transferChecked"]:
+                    info = parsed["info"]
                     amount_str = info.get("lamports") or info.get("tokenAmount", {}).get("uiAmountString", "0")
                     amount = float(amount_str or 0)
                     mint = info.get("mint", SOL_MINT)
@@ -119,7 +119,7 @@ def fetch_transactions(address: str):
             all_transfers.extend(transfers)
 
         fetched_sigs += len(sigs)
-        progress.progress(min(fetched_sigs / (fetched_sigs + limit), 1.0))  # Approximate
+        progress.progress(min(fetched_sigs / (fetched_sigs + limit), 1.0))
 
         if len(sigs) < limit:
             break
@@ -133,9 +133,6 @@ def fetch_transactions(address: str):
     status.empty()
     progress.empty()
     return df
-
-# The rest of the functions remain the same as in the previous version
-# (classify_transfers, discover_wallets, calculate_fifo, generate_pdf)
 
 def classify_transfers(df: pd.DataFrame):
     df["category"] = "Transfer"
@@ -222,7 +219,7 @@ def generate_pdf(gains: float, alerts: list, df: pd.DataFrame):
     buffer.seek(0)
     return buffer
 
-# UI remains the same
+# Mobile-Friendly UI
 st.set_page_config(layout="centered", page_title="Solana Basis")
 st.title("🪙 Free Solana Cost Basis Calculator")
 st.caption("Mobile • 2025 IRS Per-Wallet FIFO • No signup")
