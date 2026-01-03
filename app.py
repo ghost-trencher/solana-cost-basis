@@ -86,10 +86,10 @@ def fetch_transactions(address: str):
             if not tx:
                 continue
 
-            # Correct access: transaction and meta are in tx.transaction
+            # Structure: tx.transaction.meta and tx.transaction.transaction.message.instructions
             encoded_tx = tx.transaction
             meta = encoded_tx.meta
-            transaction = encoded_tx.transaction
+            inner_transaction = encoded_tx.transaction
 
             if meta and meta.err:
                 continue
@@ -97,26 +97,28 @@ def fetch_transactions(address: str):
             timestamp = datetime.utcfromtimestamp(sig_info.block_time) if sig_info.block_time else datetime.now()
 
             transfers = []
-            message = transaction.message
+            message = inner_transaction.message
             for instr in message.instructions:
-                parsed = instr.parsed
-                if parsed and parsed.get("type") in ["transfer", "transferChecked"]:
-                    info = parsed["info"]
-                    amount_str = info.get("lamports") or info.get("tokenAmount", {}).get("uiAmountString", "0")
-                    amount = float(amount_str or 0)
-                    mint = info.get("mint", SOL_MINT)
-                    source = info.get("source")
-                    destination = info.get("destination")
-                    if amount > 0:
-                        transfers.append({
-                            "asset": mint,
-                            "amount": amount,
-                            "from": source,
-                            "to": destination,
-                            "type": "Transfer",
-                            "timestamp": timestamp,
-                            "wallet": address,
-                        })
+                # Some instructions are parsed (dict with 'parsed'), others partially decoded (accounts + data)
+                if hasattr(instr, "parsed") and instr.parsed:
+                    parsed = instr.parsed
+                    if parsed.get("type") in ["transfer", "transferChecked"]:
+                        info = parsed["info"]
+                        amount_str = info.get("lamports") or info.get("tokenAmount", {}).get("uiAmountString", "0")
+                        amount = float(amount_str or 0)
+                        mint = info.get("mint", SOL_MINT)
+                        source = info.get("source")
+                        destination = info.get("destination")
+                        if amount > 0:
+                            transfers.append({
+                                "asset": mint,
+                                "amount": amount,
+                                "from": source,
+                                "to": destination,
+                                "type": "Transfer",
+                                "timestamp": timestamp,
+                                "wallet": address,
+                            })
 
             all_transfers.extend(transfers)
 
