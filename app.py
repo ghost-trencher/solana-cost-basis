@@ -72,7 +72,6 @@ def fetch_transactions(address: str):
     status = st.empty()
 
     fetched_sigs = 0
-    total_sigs_estimate = 1  # Avoid division by zero
 
     while True:
         status.text(f"Fetching signatures... ({len(all_transfers)} transfers found)")
@@ -81,23 +80,23 @@ def fetch_transactions(address: str):
         if not sigs:
             break
 
-        total_sigs_estimate += len(sigs)
         for sig_info in sigs:
             tx_resp = client.get_transaction(sig_info.signature, encoding="jsonParsed", max_supported_transaction_version=0)
             tx = tx_resp.value
             if not tx:
                 continue
 
-            # Fixed: tx is EncodedConfirmedTransactionWithStatusMeta
-            meta = tx.transaction_meta
-            message = tx.transaction.message
+            # Fixed access: meta and transaction are direct attributes
+            meta = tx.meta
+            transaction = tx.transaction
 
-            if meta.err:
+            if meta and meta.err:
                 continue
 
             timestamp = datetime.utcfromtimestamp(sig_info.block_time) if sig_info.block_time else datetime.now()
 
             transfers = []
+            message = transaction.message
             for instr in message.instructions:
                 if instr.parsed and instr.parsed.get("type") in ["transfer", "transferChecked"]:
                     info = instr.parsed["info"]
@@ -120,7 +119,7 @@ def fetch_transactions(address: str):
             all_transfers.extend(transfers)
 
         fetched_sigs += len(sigs)
-        progress.progress(min(fetched_sigs / max(total_sigs_estimate, 1), 1.0))
+        progress.progress(min(fetched_sigs / (fetched_sigs + limit), 1.0))  # Approximate
 
         if len(sigs) < limit:
             break
@@ -134,6 +133,9 @@ def fetch_transactions(address: str):
     status.empty()
     progress.empty()
     return df
+
+# The rest of the functions remain the same as in the previous version
+# (classify_transfers, discover_wallets, calculate_fifo, generate_pdf)
 
 def classify_transfers(df: pd.DataFrame):
     df["category"] = "Transfer"
@@ -166,10 +168,10 @@ def calculate_fifo(df: pd.DataFrame):
             price = get_historical_price(asset_id, date_str)
             amount = row["amount"]
 
-            if row["to"] == wallet:  # Incoming to this wallet
+            if row["to"] == wallet:  # Incoming
                 basis = amount * price
                 acquisitions.append((amount, basis))
-            elif row["from"] == wallet:  # Outgoing = disposal
+            elif row["from"] == wallet:  # Outgoing
                 remaining = amount
                 cost_basis = 0.0
                 while remaining > 0 and acquisitions:
@@ -178,7 +180,7 @@ def calculate_fifo(df: pd.DataFrame):
                     cost_basis += (use / aq_amt) * aq_basis if aq_amt > 0 else 0
                     remaining -= use
                     if use < aq_amt:
-                        remaining_basis = aq_basis - (use / aq_amt * aq_basis)
+                        remaining_basis = aq_basis * (aq_amt - use) / aq_amt
                         acquisitions.appendleft((aq_amt - use, remaining_basis))
                 if remaining > 0:
                     alerts.append(f"Missing basis for {remaining:.4f} {asset[:8]}... in {wallet[:8]}...")
@@ -220,7 +222,7 @@ def generate_pdf(gains: float, alerts: list, df: pd.DataFrame):
     buffer.seek(0)
     return buffer
 
-# Mobile-Friendly UI
+# UI remains the same
 st.set_page_config(layout="centered", page_title="Solana Basis")
 st.title("🪙 Free Solana Cost Basis Calculator")
 st.caption("Mobile • 2025 IRS Per-Wallet FIFO • No signup")
