@@ -86,9 +86,11 @@ def fetch_transactions(address: str):
             if not tx:
                 continue
 
-            # Correct attribute access for EncodedConfirmedTransactionWithStatusMeta
-            meta = tx.meta
-            transaction = tx.transaction
+            # Correct access: transaction and meta are in tx.transaction
+            encoded_tx = tx.transaction
+            meta = encoded_tx.meta
+            transaction = encoded_tx.transaction
+
             if meta and meta.err:
                 continue
 
